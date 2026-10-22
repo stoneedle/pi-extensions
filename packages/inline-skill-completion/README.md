@@ -11,14 +11,24 @@ pi 原生有两个限制：
 
 本扩展解决这两个问题：
 
-- 输入框**非行首**位置输入 `/` 时，自动弹出已安装技能的模糊匹配候选；行首 `/` 仍委托原生 slash 命令补全。
+- 消息开头 `/` 保留原生命令补全；正文空白后、后续行行首输入 `/` 就弹出技能候选，不需要先在开头选择技能。输入技能名后可继续过滤。
+- 行中技能候选用 `Enter` 或 `Tab` 插入，不会直接发送消息；`Escape` 关闭列表。空闲和运行中的主输入框行为一致，文件和路径补全保持原生行为。
 - 提交时**全权展开**文本中所有 `/skill:xxx` token，每个都渲染成原生 `[skill]` 折叠块。
 
 ## 安装
 
+本 fork 只修改本扩展，其他扩展和 Pi 核心不变。安装子目录，不要安装 monorepo 根目录（根目录分发的是其他个人扩展）：
+
 ```bash
-pi install npm:@cnife/pi-inline-skill-completion
+git clone https://github.com/stoneedle/pi-extensions.git
+cd pi-extensions
+pi install ./packages/inline-skill-completion
+pi remove npm:@cnife/pi-inline-skill-completion
 ```
+
+已安装过原 npm 包时移除它，避免重复加载；未安装时省略最后一行。在已有 Pi 会话中执行 `/reload` 生效。后续在克隆目录中 `git pull`，再 `/reload`。
+
+兼容接缝已在 Pi 1.3.0 验证：仅 TUI 使用继承 `CustomEditor` 的输入钩子，调用私有 `requestAutocomplete()` 补齐句中触发。Pi 升级后需复验此接口；RPC 等模式不替换编辑器。
 
 ## 使用
 

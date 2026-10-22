@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  CustomEditor,
   type ExtensionAPI,
   type ParsedSkillBlock,
   SkillInvocationMessageComponent,
@@ -20,8 +21,8 @@ import {
 /**
  * Inline skill completion.
  *
- * 在输入框**非行首**位置输入 `/` 时，补全已安装的技能（`/skill:<name>`）。
- * 行首 `/` 完全委托原生 slash 命令补全；非 `/` token 委托原生文件/路径补全。
+ * 在正文空白后或后续行行首输入 `/` 时，补全已安装的技能（`/skill:<name>`）。
+ * 消息开头 `/` 委托原生 slash 命令补全；非 `/` token 委托原生文件/路径补全。
  *
  * 选中后插入规范形式 `/skill:<name> `。
  *
@@ -45,8 +46,6 @@ import {
  *   - 其余文本原样保留
  */
 
-const DELIMITERS = new Set([" ", "\t", "\n"]);
-
 /** 自定义消息的 details：预解析结果，供 renderer 直接使用。 */
 interface InlineSkillsDetails {
   blocks: ParsedSkillBlock[];
@@ -60,29 +59,39 @@ interface SkillCommand {
   baseDir: string; // 技能目录，用于 skillBlock 的 References 行
 }
 
-/**
- * 提取光标前的 `/token`，仅当该 `/` **不在行首**（前面有非空白字符）时返回。
- *
- * - 行首 `/`（光标前同一行无任何非空白字符）→ 返回 null，交给原生命令补全
- * - 非行首 `/`（前面有非空白字符）→ 返回 `/` 起始的 token，如 "/ag"
- * - `/` 后含空格 → token 已结束，返回 null
- */
-function extractInlineSlashToken(textBeforeCursor: string): string | null {
-  for (let i = textBeforeCursor.length - 1; i >= 0; i--) {
-    const char = textBeforeCursor[i];
-    if (char && DELIMITERS.has(char)) {
-      // 命中分隔符：token 从 i+1 开始
-      const token = textBeforeCursor.slice(i + 1);
-      // token 必须以 `/` 开头；分隔符本身的存在意味着 `/` 前有内容（非行首）
-      if (!token.startsWith("/")) return null;
-      // `/` 后不能含空格（token 已结束）
-      if (token.length > 1 && token.slice(1).includes(" ")) return null;
-      return token;
-    }
+/** 消息开头保留原生命令；正文空白后和后续行行首只补技能，不接管路径。 */
+function extractInlineSlashToken(
+  lines: string[],
+  cursorLine: number,
+  cursorCol: number,
+): string | null {
+  const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
+  const token = beforeCursor.match(/(?:^|\s)(\/[^\s/]*)$/u)?.[1];
+  if (!token) return null;
+  if (cursorLine === 0 && beforeCursor.slice(0, -token.length).trim() === "") {
+    return null;
   }
-  // 走到行首都没遇到分隔符：整个 textBeforeCursor 是一个 token
-  // 若它以 `/` 开头，说明 `/` 在行首 → 不处理
-  return null;
+  return token;
+}
+
+/** Pi 1.3 的私有接缝：公开的 triggerCharacters 明确排除了 `/`。 */
+interface AutocompleteRequester {
+  requestAutocomplete(options: { force: boolean; explicitTab: boolean }): void;
+}
+
+class InlineSkillEditor extends CustomEditor {
+  override handleInput(data: string): void {
+    const before = this.getText();
+    super.handleInput(data);
+    if (before === this.getText() || this.isShowingAutocomplete()) return;
+
+    const { line, col } = this.getCursor();
+    if (extractInlineSlashToken(this.getLines(), line, col) === null) return;
+    (this as unknown as AutocompleteRequester).requestAutocomplete({
+      force: false,
+      explicitTab: false,
+    });
+  }
 }
 
 /**
@@ -206,6 +215,13 @@ export default function (pi: ExtensionAPI) {
         baseDir: c.sourceInfo.baseDir ?? dirname(c.sourceInfo.path),
       }));
 
+    if (ctx.mode === "tui") {
+      ctx.ui.setEditorComponent(
+        (tui, theme, keybindings) =>
+          new InlineSkillEditor(tui, theme, keybindings),
+      );
+    }
+
     // 叠加在原生补全之上：非 / 场景全部委托 current
     ctx.ui.addAutocompleteProvider(
       (current: AutocompleteProvider): AutocompleteProvider => ({
@@ -215,11 +231,9 @@ export default function (pi: ExtensionAPI) {
           cursorCol: number,
           options: { signal: AbortSignal; force?: boolean },
         ): Promise<AutocompleteSuggestions | null> {
-          const currentLine = lines[cursorLine] ?? "";
-          const textBeforeCursor = currentLine.slice(0, cursorCol);
-          const token = extractInlineSlashToken(textBeforeCursor);
+          const token = extractInlineSlashToken(lines, cursorLine, cursorCol);
 
-          // 行首 / 或非 / token：委托原生（slash 命令 / 文件 / 路径补全）
+          // 消息开头 / 或非技能 token：委托原生（命令 / 文件 / 路径补全）
           if (token === null) {
             return current.getSuggestions(
               lines,
@@ -263,7 +277,8 @@ export default function (pi: ExtensionAPI) {
             );
           }
 
-          return { items: filtered, prefix: token };
+          // 不带 `/`，让原生 Enter 只接受技能候选，不把正文当成命令提交。
+          return { items: filtered, prefix: query };
         },
 
         applyCompletion(
@@ -273,15 +288,12 @@ export default function (pi: ExtensionAPI) {
           item: AutocompleteItem,
           prefix: string,
         ): { lines: string[]; cursorLine: number; cursorCol: number } {
-          // 用与 getSuggestions 相同的上下文判定：光标前是否为非行首 / token
-          // （prefix 参数只含 token 本身，不含行首上下文，不能单独用来判断）
           const currentLine = lines[cursorLine] ?? "";
-          const textBeforeCursor = currentLine.slice(0, cursorCol);
-          const token = extractInlineSlashToken(textBeforeCursor);
+          const token = extractInlineSlashToken(lines, cursorLine, cursorCol);
 
-          // 仅处理我们的 inline `/` token（非行首）
-          if (token !== null && token === prefix) {
-            const before = currentLine.slice(0, cursorCol - prefix.length);
+          // 原生路径补全的 prefix 带 `/`，不会误走技能插入。
+          if (token !== null && token.slice(1) === prefix) {
+            const before = currentLine.slice(0, cursorCol - token.length);
             const after = currentLine.slice(cursorCol);
             // 规范形式：/skill:<name> + 尾随空格
             const insertion = `/skill:${item.value} `;
